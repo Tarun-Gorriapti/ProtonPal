@@ -3,6 +3,7 @@
 Uses the included APRILTAG_V1 Arduino sketch. No calibration or tag size needed.
 Center mount BEFORE Arduino reset; software zero/limits depend on that position.
 """
+import argparse
 import time
 import cv2
 from camera import open_camera, read_frame, close_camera
@@ -21,20 +22,32 @@ MAX_SPEED = 0.8         # Slow first test, degrees/second at geared output.
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Camera tracking + manual pan jog test")
+    parser.add_argument('--motors', action='store_true')
+    parser.add_argument('--port', default=PORT)
+    args = parser.parse_args()
     camera = arduino = None
+    jog_until = 0.0
+    jog_speed = 0.0
     tracking = False
     last_send = last_frame = time.monotonic()
     detector = create_detector("36h11")
     try:
         camera = open_camera(CAMERA)
-        if USE_MOTORS:
-            arduino = connect_arduino(PORT)
+        if USE_MOTORS or args.motors:
+            print(f"Opening {args.port} at 115200; waiting for ESP32 greeting...")
+            arduino = connect_arduino(args.port)
+            print("CONNECTED: received READY APRILTAG_V1. Press C to check ARM acknowledgment.")
+        else:
+            print("CAMERA ONLY: run with --motors --port COM9 to enable serial control.")
+        print("Click camera window. LEFT/RIGHT (or J/L): brief jog; A: tag tracking; Space: stop; Q: quit.")
         while True:
             frame = read_frame(camera)
             now = time.monotonic()
-            if tracking and now - last_frame > 0.25:
+            if (tracking or jog_until > 0) and now - last_frame > 0.25:
                 stop_motors(arduino)
-                tracking = False  # Press A again after a long camera/PC stall.
+                tracking = False
+                jog_until = 0.0
             last_frame = now
             height, width = frame.shape[:2]
             cx, cy = width / 2, height / 2
@@ -55,20 +68,55 @@ def main():
             elif tracking:
                 stop_motors(arduino)
                 tracking = False  # No automatic resume on tag reacquisition.
+            if jog_until > 0 and now >= jog_until:
+                stop_motors(arduino)
+                jog_until = 0.0
+                print("Jog stopped")
+            if jog_until > now and now - last_send >= 0.05:
+                send_velocity(arduino, jog_speed, 0.0)
+                last_send = now
             if tracking and now - last_send >= 0.05:
                 send_velocity(arduino, pan_speed, 0.0)  # Tilt ALWAYS stationary.
                 last_send = now
-            status = "TRACKING" if tracking else "PAUSED"
-            cv2.putText(frame, f"{status} | A: start/pause | SPACE: stop | Q: quit",
+            status = "JOGGING" if jog_until > now else ("TRACKING" if tracking else "PAUSED")
+            cv2.putText(frame, f"{status} | Arrows/J/L: jog | C: check | A: track | SPACE: stop | Q: quit",
                         (10,25), cv2.FONT_HERSHEY_SIMPLEX, .6, (255,255,255), 2)
             cv2.imshow("Horizontal test", frame)
-            key = cv2.waitKey(1) & 0xFF
+            key = cv2.waitKeyEx(1)
             if key == ord('q') or cv2.getWindowProperty('Horizontal test',cv2.WND_PROP_VISIBLE) < 1:
                 break
             if key == ord(' ') or (key == ord('a') and tracking):
                 if arduino is not None: stop_motors(arduino)
                 tracking = False
+                jog_until = 0.0
+            elif key in (2424832, 2555904, 65361, 65363, 81, 83, ord('j'), ord('l')):
+                if arduino is None:
+                    print("No serial connection: restart with --motors --port YOUR_PORT")
+                    continue
+                tracking = False
+                # Each key event requests only 150 ms of movement.
+                # OS key-repeat may produce successive short jogs.
+                stop_motors(arduino)
+                arm_motors(arduino)
+                left = key in (2424832, 65361, 81, ord('j'))
+                jog_speed = (-MAX_SPEED if left else MAX_SPEED) * PAN_DIRECTION
+                send_velocity(arduino, jog_speed, 0.0)
+                last_frame = last_send = time.monotonic()
+                jog_until = last_send + 0.15
+                print(f"ARM acknowledged; sent pan={jog_speed:+.2f} deg/s, tilt=0")
+            elif key == ord('c'):
+                if arduino is not None:
+                    tracking = False
+                    jog_until = 0.0
+                    stop_motors(arduino)
+                    arm_motors(arduino)
+                    stop_motors(arduino)
+                    last_frame = time.monotonic()
+                    print("PASS: ESP32 acknowledged ARM; STOP sent. This verifies serial/firmware, not motor motion.")
+                else:
+                    print("CAMERA ONLY: enable --motors and specify --port")
             elif key == ord('a') and arduino is not None and tag is not None:
+                jog_until = 0.0
                 arm_motors(arduino)
                 tracking = True
                 last_frame = time.monotonic()
